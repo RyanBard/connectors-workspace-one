@@ -6,7 +6,8 @@
 package com.vmware.connectors.github.pr;
 
 import com.google.common.collect.ImmutableMap;
-import com.vmware.connectors.common.payloads.request.CardRequest;
+import com.jayway.jsonpath.Configuration;
+import com.vmware.connectors.common.json.JsonDocument;
 import com.vmware.connectors.common.payloads.response.Card;
 import com.vmware.connectors.common.payloads.response.CardAction;
 import com.vmware.connectors.common.payloads.response.CardActionInputField;
@@ -23,6 +24,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
+import org.springframework.util.CollectionUtils;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.util.UriComponents;
@@ -31,11 +33,12 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import javax.servlet.http.HttpServletRequest;
-import javax.validation.Valid;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import static org.springframework.http.HttpHeaders.AUTHORIZATION;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
@@ -77,24 +80,36 @@ public class GithubPrController {
             @RequestHeader(BASE_URL_HEADER) String baseUrl,
             @RequestHeader(ROUTING_PREFIX) String routingPrefix,
             Locale locale,
-            @Valid @RequestBody CardRequest cardRequest,
+//            @Valid @RequestBody CardRequest cardRequest,
             final HttpServletRequest request
     ) {
-        logger.trace("getCards called: baseUrl={}, routingPrefix={}, request={}", baseUrl, routingPrefix, cardRequest);
+//        logger.trace("getCards called: baseUrl={}, routingPrefix={}, request={}", baseUrl, routingPrefix, cardRequest);
+        logger.trace("getCards called: baseUrl={}, routingPrefix={}", baseUrl, routingPrefix);
 
-        Stream<PullRequestId> pullRequestIds = cardRequest.getTokens("pull_request_urls")
-                .stream()
-                .filter(Objects::nonNull)
-                .collect(Collectors.toSet()) // squash duplicates
-                .stream()
-                .sorted()
+//        Set<String> prUrls = cardRequest.getTokens("pull_request_urls");
+        Set<String> prUrls = new HashSet<>();
+
+        Flux<String> prUrlsFlux;
+
+        if (CollectionUtils.isEmpty(prUrls)) {
+            prUrlsFlux = getUsername(baseUrl, auth)
+                    .flatMapMany(username -> getAllOpenPrs(baseUrl, auth, username));
+        } else {
+            prUrlsFlux = Flux.fromStream(
+                    prUrls.stream()
+                            .filter(Objects::nonNull)
+                            .collect(Collectors.toSet()) // squash duplicates
+                            .stream()
+                            .sorted()
+            );
+        }
+
+        return prUrlsFlux
                 .map(this::parseUri)
                 .filter(Objects::nonNull)
                 .filter(this::validHost)
                 .map(this::getPullRequestId)
-                .filter(Objects::nonNull);
-
-        return Flux.fromStream(pullRequestIds)
+                .filter(Objects::nonNull)
                 .flatMap(pullRequestId -> fetchPullRequest(baseUrl, pullRequestId, auth))
                 .map(pair -> makeCard(routingPrefix, pair, locale, request))
                 .reduce(
@@ -106,6 +121,35 @@ public class GithubPrController {
                 )
                 .defaultIfEmpty(new Cards())
                 .subscriberContext(Reactive.setupContext());
+    }
+
+    private Mono<String> getUsername(
+            String baseUrl,
+            String auth
+    ) {
+        return rest.get()
+                .uri(baseUrl + "/user")
+                .header(AUTHORIZATION, auth)
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(s -> new JsonDocument(Configuration.defaultConfiguration().jsonProvider().parse(s)))
+                .map(doc -> doc.read("$.login"));
+    }
+
+    private Flux<String> getAllOpenPrs(
+            String baseUrl,
+            String auth,
+            String username
+    ) {
+        String query = "state:open type:pr assignee:" + username;
+        return rest.get()
+                .uri(baseUrl + "/search/issues?q={query}", query)
+                .header(AUTHORIZATION, auth)
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(s -> new JsonDocument(Configuration.defaultConfiguration().jsonProvider().parse(s)))
+                .map(doc -> doc.<List<String>>read("$.items[*].html_url"))
+                .flatMapMany(Flux::fromIterable);
     }
 
     private UriComponents parseUri(
